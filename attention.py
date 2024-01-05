@@ -1,91 +1,126 @@
 import jax
 from jax import numpy as jnp
-from jax import random
-from jax import nn
+from jax import random, nn, lax
+import equinox as eqx
+import jaxtyping
+from jaxtyping import Float
+from jaxtyping import Array
+from jaxtyping import Scalar
+from jaxtyping import PRNGKeyArray
+import math
 
-def attention_layer(key_dim, value_dim, model_dim, name, batch_size, key = 0):
-    key = random.PRNGKey(key)
-    ## W_Q is d_model x d_key
-    W_Q = random.normal(key, (model_dim, key_dim))
-    ## W_K is d_model x d_key
-    W_K = random.normal(key, (model_dim, key_dim))
-    ## W_V is d_model x d_value
-    W_V = random.normal(key, (model_dim, value_dim))
-    ## q, k and v are b x n x d_model
-    def attention(q, k, v):
-        return nn.softmax((q@W_Q)@((k@W_K).transpose((0,2,1))), axis=2)@(v@W_V)
-
-    params = {name: dict(W_Q = W_Q, W_K = W_K, W_V = W_V)}
-    return attention, params
-
-def attention_layer_smoke_test():
-    key_dim = 2
-    value_dim = 4
-    model_dim = 3
-    name = 'attention'
-    key = random.PRNGKey(0)
-    x = attention_layer(key_dim, value_dim, model_dim, name)
-    q = random.normal(key, (5, model_dim))
-    k = random.normal(key, (5, model_dim))
-    v = random.normal(key, (5, model_dim))
-
-    att = x[0](q,k,v)
-
-    print(att)
-    print(x[1])
-
-def attention_take_apart():
-    ## q, k, v are batch size x max input seq length x model dimension
-    batch_size = 2
-    model_dim = 3
-    value_dim = 4
-    key_dim = 5
-    max_seq_length = 3
-    key = random.PRNGKey(0)
-    ## These are linear projections from input embeddings to q,k,v.
-    W_Q = random.normal(key, (model_dim, key_dim))
-    ## W_K is d_model x d_key
-    W_K = random.normal(key, (model_dim, key_dim))
-    ## W_V is d_model x d_value
-    W_V = random.normal(key, (model_dim, value_dim))
-                          
-    ## q, k and v are b x n x d_model
-    q = random.normal(key, (batch_size, max_seq_length, model_dim))
-    k = random.normal(key, (batch_size, max_seq_length, model_dim))
-    v = random.normal(key, (batch_size, max_seq_length, model_dim))
-
-    ## A cool feature of matrix multiplication in numpy (jax numpy) is that
-    ## for 3-d matrices, the matrices along the 0th axis are pair-wise multiplied.
-    ## Therefore, if the first dimension is batch size, this just multiplies inputs
-    ## for corresponding batch together.
-    ## Input sizes: batch_size x max_seq_length x model_dim and model_dim x key_dim
-    ## W_Q will be broadcast to size batch_size x model_dim x key_dim
-    ## Output size: batch_size x max_seq_length x key_dim
-    q_projection = q@W_Q
-    ## Similarly, output of size batch_size x max_seq_length x key_dim
-    k_projection = k@W_K
-    ## Output of size batch_size x max_seq_length x value_dim
-    v_projection = v@W_V
-
-    ## Compute attention
-    ## When taking transpose, keep batch size dimension as is, only transpose the
-    ## other dimensions.
-    ## Output of size batch_size x max_seq_length x max_seq_length
-    ## Each row tells how important a value is for each query
-    A_non_normalized = q_projection@(k_projection.transpose((0,2,1)))
-    A = nn.softmax(A_non_normalized, axis=2)
-
-    ## Output is a linear combination of values weighted by importance, as given
-    ## by attention matrix A.
-    ## E.g., for q_i (i.e., query corresponding to i_th input token), output will be
-    ## sum over j (A_ij*v_j)
-        
-    print(A)
-
-                          
-    output = A@v_projection
-
-    print(output)                      
-    return (A, output)
-                
+class Config:
+    T = 128 # Max input sequence length, timesteps
+    batch_size = 100
+    D = 512 # Embedding dimension
+    nh = 8 # Number of heads
+    eps_ls = 0.1 # Label smoothing
+    dropout_p = 0.1 # Dropout rate
+    feed_forward_dim = 2048
+    adam_beta1 = 0.9
+    adam_beta2 = 0.98
+    adam_eps = 1e-9
+    n_encoder_blocks = 6
+    n_decoder_blocks = 6
     
+class LayerNorm(eqx.Module):
+    weight: Float[Array , '...']
+    eps: float
+    
+    def __init__(self, shape, eps=1e-5):
+        ## Learnable affine weights
+        self.weight = jnp.ones(shape)
+        self.eps = eps
+
+    def __call__(self, x: Float[Array, "..."]):
+        """Use vmap if normalizing along a particular dimension."""
+        mu = jnp.mean(x, keepdims=True)
+        sigma = jnp.var(x, keepdims=True)
+        return ((x - mu) * jax.lax.rsqrt(sigma + self.eps))*self.weight
+        
+
+class Embedding(eqx.Module):
+    def __init__(self, vocab_size, emb_dims, key: PRNGKeyArray):
+        self.vocab_size = vocab_size
+        self.emb_dims = emb_dims
+        self.W = random.normal(key, (vocab_size, emb_dims))
+
+    def __call__(self, x: Scalar) -> Float[Array, "{self.emb_dims}"]:
+        """Use vmap if indexing by an array."""
+        return self.W[x]
+        
+
+class Dropout(eqx.Module):
+    def __init__(self, p):
+        self.p = p
+        
+    def __call__(x, deterministic: bool, key: PRNGKeyArray):
+        if deterministic:
+            return x
+        keep_p = 1 - self.p
+        mask = random.bernoulli(key, p=keep_p, shape=x.shape)
+        return lax.select(mask, x/keep_p, jnp.zeros_like(x))
+        
+
+class Linear(eqx.Module):
+    in_size: int
+    out_size: int
+    use_bias: bool
+    weight: Float[Array, '...']
+    
+    def __init__(self, in_size: int, out_size: int, key: PRNGKeyArray, use_bias=True):
+        wkey, bkey = random.split(key, 2)
+        self.in_size = in_size
+        self.out_size = out_size
+        self.use_bias = use_bias
+        lim = 1/math.sqrt(in_size)
+        self.weight = random.uniform(wkey, (out_size, in_size), minval=-lim, maxval=lim)
+        if self.use_bias:
+            self.bias = random.uniform(bkey, (out_size,), minval=-lim, maxval=lim)
+
+    def __call__(self, x: Float[Array, "in_size"]) -> Float[Array, "out_size"]:
+        x = self.weight @ x
+        if self.use_bias:
+            x = x + self.bias
+        return x
+        
+    
+class MultiHeadedAttention(eqx.Module):
+    masked: bool
+    emb_dims: int
+    nh: int
+    q_dim: int
+    norm: float
+    input_proj: Linear
+    out_proj: Linear
+    
+    def __init__(self, emb_dims, nh, key, masked=False):
+        assert emb_dims % nh == 0
+        self.masked = masked
+        self.emb_dims = emb_dims
+        self.nh = nh
+        self.q_dim = self.emb_dims // self.nh
+        self.norm = 1.0/math.sqrt(self.q_dim)
+        in_key, out_key = random.split(key)
+        self.input_proj = Linear(self.emb_dims, 3*self.emb_dims, in_key, use_bias=False)
+        self.out_proj = Linear(emb_dims, emb_dims, out_key, use_bias=False)
+        
+    def __call__(self,
+                 x: Float[Array, "T {self.emb_dims}"]) -> Float[Array, "T {self.emb_dims}"]:
+        T = x.shape[0]
+        Q, K, V = jnp.split(jax.vmap(self.input_proj)(x), 3, -1)
+        # (nh X T x q_dim)
+        Q = jnp.reshape(Q, (T, self.nh, self.emb_dims//self.nh)).transpose((1, 0, 2))
+        K = jnp.reshape(K, (T, self.nh, self.emb_dims//self.nh)).transpose((1, 0, 2))
+        V = jnp.reshape(V, (T, self.nh, self.emb_dims//self.nh)).transpose((1, 0, 2))
+        A = Q@(K.transpose(0, 2, 1)) * self.norm ## (nh x T x T)
+        if self.masked:
+            mask = jnp.tri(A.shape[1]) != 0
+            masked_values = jnp.ones_like(mask)*float('-inf')
+            def masking(a):
+                return jax.lax.select(mask, a, masked_values)
+            A = jax.vmap(masking)(A)
+        y = jnp.concatenate(nn.softmax(A)@V, axis=1) # softmax axis = -1, (T x emb_dims)
+        return jax.vmap(self.out_proj)(y)
+        
+        
