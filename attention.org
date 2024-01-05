@@ -1,7 +1,5 @@
 #+TITLE: Attention From Scratch
 
-This is a literate programming documentat about implementation of a simple transformer as described in "Attention is all you need" paper.
-
 * Basics of attention
 In context of sequential data, attention allows neural networks to communicate about connection between various input tokens and input and output tokens. As an example, consider the details of attention in the encoder blocks which is a bit simpler to understand but amply highlights the communication aspect of attention blocks.
 
