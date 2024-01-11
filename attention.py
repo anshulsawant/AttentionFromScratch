@@ -8,7 +8,8 @@ from jaxtyping import Scalar
 from jaxtyping import PRNGKeyArray
 import math
 from typing import Optional
-
+import dataclasses
+import dataset as ds
 
 class LayerNorm(eqx.Module):
     weight: Float[Array, '...']
@@ -30,7 +31,7 @@ class Embedding(eqx.Module):
     vocab_size: int
     emb_dims: int
     W: Float[Array, "{self.vocab_size} {self.emb_dims}"]
-    
+
     def __init__(self, vocab_size, emb_dims, key: PRNGKeyArray):
         self.vocab_size = vocab_size
         self.emb_dims = emb_dims
@@ -134,7 +135,7 @@ class MultiHeadedAttention(eqx.Module):
                  deterministic,
                  key: PRNGKeyArray,
                  # Which inputs to ignore (because of padding or causality)
-                 mask: Optional[Float[Array, "T T_prime"]]=None
+                 mask: Bool[Array, "T T_prime"]
                  ) -> Float[Array, "T_prime {self.emb_dims}"]:
         Q = jax.vmap(self.q_proj)(q)
         K = jax.vmap(self.k_proj)(k)
@@ -148,13 +149,11 @@ class MultiHeadedAttention(eqx.Module):
         V = jnp.reshape(
             V, (-1, self.nh, self.emb_dims//self.nh)).transpose((1, 0, 2))
         A = Q@(K.transpose(0, 2, 1)) * self.norm  # (nh x T x T')
-        if mask is not None:
-            mask = mask != 0
-            masked_values = jnp.ones_like(mask)*float('-inf')
-            
-            def masking(a):
-                return jax.lax.select(mask, a, masked_values)
-            A = jax.vmap(masking)(A)
+        masked_values = jnp.ones_like(mask)*float('-inf')
+
+        def masking(a):
+            return jax.lax.select(mask, a, masked_values)
+        A = jax.vmap(masking)(A)
         # softmax axis = -1, (T x emb_dims)
         y = jnp.concatenate(nn.softmax(A)@V, axis=1)
         y = jax.vmap(self.out_proj)(y)
@@ -270,11 +269,11 @@ class Transformer(eqx.Module):
     decoder: DecoderStack
     linear: Linear
     emb_factor: float
-    
+
     def __init__(self,
                  vocab_size,
                  emb_dims,
-                 input_seq_length,
+                 max_input_seq_length,
                  n_blocks,
                  nh,
                  ff_dim,
@@ -284,7 +283,7 @@ class Transformer(eqx.Module):
             key, 5)
         self.token_embedding = Embedding(vocab_size, emb_dims, te_key)
         self.positional_embedding = Embedding(
-            input_seq_length, emb_dims, pe_key)
+            max_input_seq_length, emb_dims, pe_key)
         self.encoder = EncoderStack(
             n_blocks, emb_dims, nh, ff_dim, dropout_p, encoder_key)
         self.decoder = DecoderStack(
@@ -309,3 +308,40 @@ class Transformer(eqx.Module):
                          cross_attention_mask, causal_mask)
         x = jax.vmap(self.linear)(x)
         return nn.softmax(x, axis=-1)
+
+
+
+
+
+@dataclasses.dataclass
+class Config:
+    max_input_seq_length: int = 100
+    bucket: int = 10
+    batch_tokens: int = 25000
+    vocab_size: int = 32000
+    emb_dims: int = 512
+    n_blocks: int = 6
+    nh: int = 8
+    ff_dim: int = 2048
+    dropout_p: float = 0.1
+    seed: int = 0
+    n: int = None
+
+def build_training_pipeline(config: Config):
+    dataset = ds.load_training_data()
+    tokenizer = ds.train_tokenizer(dataset, config.vocab_size)
+    dataset = ds.augment_dataset_for_training(
+        dataset, tokenizer, config.max_input_seq_length, config.bucket)
+    transformer = Transformer(config.vocab_size,
+                              config.emb_dims,
+                              config.max_input_seq_length,
+                              config.n_blocks,
+                              config.nh,
+                              config.ff_dim,
+                              config.dropout_p,
+                              random.PRNGKey(config.seed))
+    data_gen = ds.training_data_generator(dataset, config.batch_tokens)
+    return (transformer, data_gen)
+
+    
+    
