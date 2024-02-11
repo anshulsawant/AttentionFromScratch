@@ -15,7 +15,7 @@ import nltk
 class LayerNorm(eqx.Module):
     weight: Float[Array, "..."]
     eps: float
-
+    
     def __init__(self, shape, eps=1e-5):
         # Learnable affine weights
         self.weight = jnp.ones(shape)
